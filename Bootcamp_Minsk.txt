@@ -1,0 +1,132 @@
+ # 1. Уберем старый репозиторий
+ sudo rm -r postgres/
+
+ # 2. Склонируем и соберем репозиторий
+ git clone -b REL_16_1 --single-branch https://github.com/postgres/postgres
+ cd postgres/
+
+ ./configure --prefix=/usr/local/pgsql \
+   --enable-tap-tests \
+   --with-python \
+   --with-icu \
+   --with-lz4 \
+   --with-zstd \
+   --enable-debug \
+   --enable-cassert
+
+make -j 4
+sudo make install
+
+# 3. Добавим Makefile и TAP-тест
+mkdir src/test/modules/wal_bootcamp/
+mkdir src/test/modules/wal_bootcamp/t/
+
+------------------------------------------------------------------------------
+
+cat > src/test/modules/wal_bootcamp/Makefile << 'EOL'
+# src/test/modules/wal_bootcamp/Makefile
+
+PGFILEDESC = "wal_bootcamp - test module to read WAL from WAL buffers"
+
+TAP_TESTS = 1
+
+ifdef USE_PGXS
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+else
+subdir = src/test/modules/wal_bootcamp
+top_builddir = ../../../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
+endif
+
+EOL
+
+------------------------------------------------------------------------------
+
+cat >> src/test/modules/wal_bootcamp/t/001_test.pl << 'EOL'
+use strict;
+use warnings;
+
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+
+my $primary = PostgreSQL::Test::Cluster->new('main');
+
+$primary->init(allows_streaming => 1);
+
+$primary->append_conf(
+'postgresql.conf', qq(
+    autovacuum = off
+    checkpoint_timeout = 1h
+    wal_writer_delay = 10000ms
+    wal_writer_flush_after = 1GB
+    synchronous_commit = on
+    log_min_messages = DEBUG1
+    wal_keep_size = 256MB
+    shared_buffers = 100MB
+    wal_buffers = 16MB
+    wal_sender_timeout = 0
+    wal_receiver_timeout = 0
+));
+$primary->start;
+$primary->backup('backup');
+
+# Start a standby node, and wait for it to catch up.
+my $standby = PostgreSQL::Test::Cluster->new('standby');
+$standby->init_from_backup(
+    $primary, 'backup',
+    standby       => 1,
+    has_streaming => 1,
+    has_restoring => 0);
+$standby->start;
+
+my $walsender_pid = $primary->safe_psql('postgres', "SELECT pid FROM pg_stat_replication");
+print "walsender PID = $walsender_pid \n";
+
+# Generate minimal WAL so that WAL buffers don't get overwritten.
+$primary->safe_psql('postgres',
+    "CREATE TABLE t (id int, email text); INSERT INTO t VALUES (1, 'wal');");
+
+# Sync master and stanby
+my $replay_lsn;
+my $receive_lsn;
+do {
+   $replay_lsn = $standby->safe_psql('postgres', "SELECT pg_last_wal_replay_lsn()");
+   $receive_lsn = $standby->safe_psql('postgres', "SELECT pg_last_wal_receive_lsn()");
+   sleep(1);
+} while ($replay_lsn ne $receive_lsn);
+
+my ${result} = $standby->safe_psql('postgres', "SELECT email FROM t;");
+is($result, "wal", "Check inserting first row");
+
+done_testing();
+EOL
+
+------------------------------------------------------------------------------
+
+# 4. Добавим пару точек останова в тестах для комментариев и подключении к walsender
+
+make -C src/test/modules/wal_bootcamp/ check
+
+sed -i '28i <STDIN>;' src/test/modules/wal_bootcamp/t/001_test.pl
+sed -i '29i print "------------------------------------------------\n";' src/test/modules/wal_bootcamp/t/001_test.pl
+
+sed -i '43i <STDIN>;' src/test/modules/wal_bootcamp/t/001_test.pl
+sed -i '44i print "------------------------------------------------\n";' src/test/modules/wal_bootcamp/t/001_test.pl
+
+make -C src/test/modules/wal_bootcamp/ check
+
+2. Открыть новый терминал
+==============================================================================
+
+# 5. Откроем логи
+cd ~/postgres
+tail -f src/test/modules/wal_bootcamp/tmp_check/log/regress_log_001_test
+
+# 6. Приаттачиваемся к walsender
+sudo gdb -p <PID>
+handle SIGQUIT nostop noprint pass
+continue
